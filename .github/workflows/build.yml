@@ -1,0 +1,124 @@
+name: Build FakePass
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.scheme }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme:
+          - rootful
+          - rootless
+
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache Theos & SDKs
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.THEOS }}
+          key: theos-env-v1-${{ runner.os }}-${{ hashFiles('Makefile', 'prefs/Makefile') }}
+          restore-keys: |
+            theos-env-v1-${{ runner.os }}-
+
+      - name: Setup Theos, SDKs, and libSandy
+        run: |
+          set -e
+          # 1. Setup Theos if not cached
+          if [ ! -d "$THEOS" ] || [ ! -f "$THEOS/makefiles/common.mk" ]; then
+            echo "::group::Cloning Theos"
+            rm -rf "$THEOS"
+            git clone --recursive https://github.com/theos/theos.git "$THEOS"
+            echo "::endgroup::"
+          fi
+
+          # 2. Setup iOS SDKs if missing
+          if [ ! -d "$THEOS/sdks/iPhoneOS14.5.sdk" ] && [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ]; then
+            echo "::group::Downloading Patched iOS SDKs"
+            curl -fsSL https://github.com/theos/sdks/archive/master.zip -o sdks.zip
+            unzip -q sdks.zip
+            mkdir -p "$THEOS/sdks"
+            mv sdks-master/*.sdk "$THEOS/sdks/"
+            rm -rf sdks.zip sdks-master
+            echo "::endgroup::"
+          fi
+
+          # 3. Setup libSandy if missing
+          if [ ! -f "$THEOS/include/libSandy.h" ] || [ ! -f "$THEOS/lib/libsandy.dylib" ] || [ ! -f "$THEOS/lib/iphone/rootless/libsandy.dylib" ]; then
+            echo "::group::Building and Installing libSandy"
+            rm -rf /tmp/libSandy
+            git clone https://github.com/opa334/libSandy.git /tmp/libSandy
+            cd /tmp/libSandy
+            mkdir -p "$THEOS/lib/iphone/rootless"
+            chmod +x install_to_theos.sh
+            ./install_to_theos.sh
+            ln -sf "$THEOS/lib/libsandy.dylib" "$THEOS/lib/libSandy.dylib" 2>/dev/null || true
+            ln -sf "$THEOS/lib/iphone/rootless/libsandy.dylib" "$THEOS/lib/iphone/rootless/libSandy.dylib" 2>/dev/null || true
+            cd -
+            rm -rf /tmp/libSandy
+            echo "::endgroup::"
+          fi
+
+      - name: Build Tweak (${{ matrix.scheme }})
+        run: |
+          make clean
+          if [ "${{ matrix.scheme }}" = "rootless" ]; then
+            echo "Building rootless package..."
+            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          else
+            echo "Building rootful package..."
+            make package FINALPACKAGE=1
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FakePass-${{ matrix.scheme }}
+          path: packages/*.deb
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all deb packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-packages
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-packages/*.deb
+          generate_release_notes: true
